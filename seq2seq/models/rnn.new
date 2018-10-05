@@ -1,0 +1,229 @@
+import tensorflow as tf
+from tensorflow.models.rnn import rnn_cell, rnn
+from tensorflow.models.rnn import seq2seq
+
+import numpy as np
+import copy
+
+class RnnAutoencoder(object):
+    def __init__(self, rnn_type, dim_emb, num_units, batch_size, vocab_size, seq_len, 
+                 grad_clip, learning_rate, infer):
+        self.rnn_type = rnn_type
+        self.dim_emb = dim_emb
+        self.num_units = num_units
+        self.batch_size = batch_size
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
+        self.grad_clip = grad_clip
+        self.lr = learning_rate
+        self.TOWER_NAME = 'tower'
+       
+
+    def get_inputs(self, infer=False):
+        x_in = tf.placeholder(tf.int32, [None, self.seq_len])  # input sequence
+        lx_in = tf.placeholder(tf.int32, [None]) # length for input sequence
+        y_in = tf.placeholder(tf.int32, [None, 1 if infer else self.seq_len])  # output sequence
+        my_in = tf.placeholder(tf.float32, [None, 1 if infer else self.seq_len]) # mask for output sequence
+        return x_in, lx_in, y_in, my_in
+
+
+    def build_model(self, inputs, infer):
+    	x_in, lx_in, y_in, my_in = inputs
+
+        if self.rnn_type == 'rnn':
+            cell_fn = rnn_cell.BasicRNNCell
+        elif self.rnn_type == 'gru':
+            cell_fn = rnn_cell.GRUCell
+        elif self.rnn_type == 'lstm':
+            cell_fn = rnn_cell.BasicLSTMCell
+        else:
+            raise Exception('rnn type not supported: {}'.format(rnn_type))
+
+        cell_enc = cell_fn(self.num_units)
+        cell_dec = cell_fn(self.num_units)
+    
+        embedding = tf.get_variable('embedding', [self.vocab_size, self.dim_emb])
+
+        # encoding
+        enc_in = tf.nn.embedding_lookup(embedding, x_in)
+        enc_in = tf.split(1, self.seq_len, enc_in)
+        enc_in = [tf.squeeze(input_, [1]) for input_ in enc_in]
+
+        _, initial_state = rnn.rnn(cell_enc, enc_in, sequence_length=lx_in, dtype='float32', scope='encoder')
+        self.initial_state = initial_state
+    
+        # decoding
+        if infer == False: 
+            dec_in = tf.nn.embedding_lookup(embedding, tf.concat(1, [tf.zeros([self.batch_size, 1],
+                dtype='int32'), y_in[:, :self.seq_len-1]]))
+            dec_in = tf.split(1, self.seq_len, dec_in)
+            dec_in = [tf.squeeze(input_, [1]) for input_ in dec_in]
+        else:
+            dec_in = tf.nn.embedding_lookup(embedding, y_in)
+            dec_in = tf.split(1, 1, dec_in)
+            dec_in = [tf.squeeze(input_, [1]) for input_ in dec_in]
+        
+        output, last_state = seq2seq.rnn_decoder(dec_in, initial_state, cell_dec, scope='decoder')
+        output = tf.reshape(tf.concat(1, output), [-1, self.num_units])
+        self.last_state = last_state
+        
+        # get loss
+        #with tf.variable_scope('softmax'):
+        softmax_w = tf.get_variable('softmax_w', [self.num_units, self.vocab_size])
+        softmax_b = tf.get_variable('softmax_b', [self.vocab_size])
+
+        logits = tf.matmul(output, softmax_w) + softmax_b
+        print "logits shape:", logits.get_shape()
+        self.probs = tf.nn.softmax(logits)
+        print "self.probs shape:", self.probs.get_shape()
+
+        loss = tf.nn.seq2seq.sequence_loss_by_example([logits],
+                                                      [tf.reshape(y_in, [-1])],
+                                                      [tf.reshape(my_in, [-1])])
+        #self.loss = loss
+
+        print "loss shape:", loss.get_shape()
+        self.cost = cost = tf.reduce_sum(loss) / tf.to_float(self.batch_size)
+        self.loss = cost
+        #tvars = tf.trainable_variables()
+        #grads = tf.gradients(cost, tvars)
+        #if self.grad_clip: grads, _ = tf.clip_by_global_norm(grads, self.grad_clip)
+        #optimizer = tf.train.AdamOptimizer(self.lr)
+        #self.train_op = optimizer.apply_gradients(zip(grads, tvars))
+
+        return cost
+
+
+
+    def calc_infer_num_per_source(self, cand_size, infer_from_source_num):
+        ret_lst = []
+        for _ in range(infer_from_source_num):
+            ret_lst.append([0, 0])
+        for i in range(cand_size):
+            ret_lst[i % infer_from_source_num][0] += 1
+        return ret_lst
+
+    def _is_ignore_token(self, trans_idx_to_source_id_dict, per_source_cand_size_lst, trans_idx):
+        source_id = -1
+        if trans_idx_to_source_id_dict.has_key(trans_idx):
+            source_id = trans_idx_to_source_id_dict[trans_idx]
+        else:
+            new_source_id = len(trans_idx_to_source_id_dict)
+            trans_idx_to_source_id_dict[trans_idx] = new_source_id
+            source_id = new_source_id
+        if source_id == -1:
+            print("error at _is_ignore_token")
+            sys.exit(1)
+        if per_source_cand_size_lst[source_id][0] > per_source_cand_size_lst[source_id][1]:
+            per_source_cand_size_lst[source_id][1] += 1
+            return False
+        else:
+            return True
+
+    def select_cand(self, cand_scores, cand_size):
+        infer_from_source_num = len(cand_scores)
+        per_source_cand_size_lst = self.calc_infer_num_per_source(cand_size, infer_from_source_num)
+
+
+        selected_idx = []
+
+        trans_idx_to_source_id_dict = {}
+        cand_flat = cand_scores.flatten()
+        for global_idx in cand_flat.argsort():
+            if len(selected_idx) >= cand_size:
+                break
+            self.count+=1
+            trans_idx = global_idx / self.vocab_size
+            word_idx = global_idx % self.vocab_size
+            if False and self._is_ignore_token(trans_idx_to_source_id_dict, per_source_cand_size_lst, trans_idx):
+                continue
+            else:
+                selected_idx.append((global_idx, trans_idx, word_idx))
+        return selected_idx, cand_flat
+
+    def select_cand2(self, cand_scores, cand_size, diversity = True):
+        if diversity:
+            infer_from_source_num = len(cand_scores)
+            per_source_cand_size_lst = self.calc_infer_num_per_source(cand_size, infer_from_source_num)
+            max_cand_in_one_source = max([x[0] for x in per_source_cand_size_lst])
+        else:
+            max_cand_in_one_source = cand_size
+
+        selected_idx = []
+        trans_idx_to_source_id_dict = {}
+        cand_flat = cand_scores.flatten()
+
+        top_indices = np.argsort(cand_scores, axis=1)[:, :max_cand_in_one_source]
+        top_cand_wid_scores = []
+        for i, row in enumerate(top_indices):
+            for j, w_idx in enumerate(row):
+                top_cand_wid_scores.append((i, w_idx, cand_scores[i][w_idx]))
+        top_cand_wid_scores.sort(key = lambda x:x[2])
+        for (trans_idx, word_idx, score) in top_cand_wid_scores:
+            if len(selected_idx) >= cand_size:
+                break
+            self.count+=1
+            if diversity and self._is_ignore_token(trans_idx_to_source_id_dict, per_source_cand_size_lst, trans_idx):
+                continue
+            else:
+                global_idx = self.vocab_size * trans_idx + word_idx
+                selected_idx.append((global_idx, trans_idx, word_idx))
+        return selected_idx, cand_flat
+
+
+
+    def generate(self, sess, vocab, sym_x, sym_lx, sym_y, x_in, lx_in, beam_size, max_seq_len):
+        self.count = 0
+        state = sess.run(self.initial_state, {sym_x: x_in, sym_lx: lx_in})
+        live_k, dead_k = 1, 0
+        samples, sample_scores = [], []
+        hyp_samples, hyp_scores, hyp_states = [[]]*live_k, np.zeros(live_k).astype('float32'), []
+            
+        yi = np.zeros((1,1), dtype='int32')
+        for i in range(max_seq_len):
+            prob, state = sess.run([self.probs, self.last_state], {sym_y: yi, self.initial_state: state})
+            cand_scores = hyp_scores[:, None] - np.log(prob)
+            '''
+            cand_flat = cand_scores.flatten()
+            ranks_flat = cand_flat.argsort()[: (beam_size - dead_k)]
+            trans_idx = ranks_flat / np.int64(self.vocab_size)
+            word_idx = ranks_flat % np.int64(self.vocab_size)
+            costs = cand_flat[ranks_flat]
+            '''
+            selected_idx, cand_flat = self.select_cand2(cand_scores, beam_size - dead_k, False)
+            new_hyp_samples, new_hyp_scores, new_hyp_states = [], np.zeros(beam_size-dead_k,
+                    dtype='float32'), []
+            #for idx, [ti, wi] in enumerate(zip(trans_idx, word_idx)):
+            for idx, (global_idx, ti, wi) in enumerate(selected_idx):
+                new_hyp_samples.append(hyp_samples[ti] + [wi])
+                #new_hyp_scores[idx] = copy.copy(costs[idx])
+                new_hyp_scores[idx] = copy.copy(cand_flat[global_idx])
+                new_hyp_states.append(copy.copy(state[ti]))
+
+            new_live_k, hyp_samples, hyp_scores, hyp_states = 0, [], [], []
+            for idx in range(len(new_hyp_samples)):
+                if new_hyp_samples[idx][-1] == 0:
+                    samples.append(new_hyp_samples[idx])
+                    sample_scores.append(new_hyp_scores[idx])
+                    dead_k += 1
+                else:
+                    new_live_k += 1
+                    hyp_samples.append(new_hyp_samples[idx])
+                    hyp_scores.append(new_hyp_scores[idx])
+                    hyp_states.append(new_hyp_states[idx])
+
+            hyp_scores = np.asarray(hyp_scores)
+            live_k = new_live_k
+            if live_k < 1:
+                break
+            if dead_k >= beam_size:
+                break
+
+            yi, state = np.array([[w[-1]] for w in hyp_samples], dtype='int32'), np.array(hyp_states)
+
+        if live_k > 0:
+            for idx in range(live_k):
+                samples.append(hyp_samples[idx])
+                sample_scores.append(hyp_scores[idx])
+        print("----loop times----", self.count)
+        return samples, sample_scores
