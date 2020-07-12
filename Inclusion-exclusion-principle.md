@@ -7,7 +7,7 @@ Thus, S(n) = (n-1)S(n-1) + (n-1)S(n-2). Here, we can easily use this formula to 
 
 There is another solution for this problem from a very different viewpoint, someone try to introduce "Inclusion-Exclusion-Principle" here.
 #combo = #total - #at_least_one_same (#total means all types and is equal to n!, #at_least_one_same means the number of combo that there is at least one person who get his own hat).
-Typically, It is indicated that #at_least_one_same = #at_least_1_same \and #at_least_2 \and #at_least_3_same \and ... \and #at_least_n_same. (#at_S()least_n_same means the number of combos that the n-th person get his own hat correctly).  
+Typically, It is indicated that #at_least_one_same = #at_least_1_same $\and$ #at_least_2 \and #at_least_3_same \and ... \and #at_least_n_same. (#at_S()least_n_same means the number of combos that the n-th person get his own hat correctly).  
 Thus, we can easily derive:
   
   S(n) = n! - 1Cn(n-1)! + 2Cn(n-2)! - 3Cn(n-3)! +- ... +- nCn(0!)
